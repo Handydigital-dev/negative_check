@@ -1,0 +1,10 @@
+streamlit
+aiohttp
+fake-useragent
+beautifulsoup4
+python-dotenv
+pandas
+plotly
+textblob
+altair
+nltk

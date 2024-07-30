@@ -16,12 +16,12 @@ import altair as alt
 import re
 from collections import Counter
 import nltk
+import chardet
+
 nltk.download('punkt')
 
-# 環境変数を読み込む
 load_dotenv()
 
-# 定数の定義
 API_ENDPOINTS = {
     "CLAUDE": "https://api.anthropic.com/v1/messages",
 }
@@ -34,40 +34,39 @@ MAX_BACKOFF_DELAY = 60
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
 
-# キーワードリスト（カテゴリ別）
-KEYWORDS = {
-    "政治的思想・発言": ["政治", "発言", "批判", "論争", "抗議", "デモ", "選挙", "党", "イデオロギー"],
-    "問題・事件・事故・脱税": ["逮捕", "事件", "事故", "脱税", "違法", "犯罪", "摘発", "調査", "疑惑"],
-    "薬物・裏社会・暴力": ["薬物", "麻薬", "暴力", "暴行", "違法", "逮捕", "組織", "犯罪", "事件"],
-    "性蔑視・ジェンダー・LGBT": ["差別", "蔑視", "セクハラ", "ハラスメント", "批判", "抗議", "論争", "LGBT"],
-    "熱愛・不倫": ["不倫", "浮気", "スキャンダル", "離婚", "破局", "熱愛", "交際", "恋愛"],
-    "炎上": ["炎上", "批判", "謝罪", "批判", "批判殺到", "非難", "バッシング", "問題発言"],
-    "宗教": ["宗教", "カルト", "信者", "布教", "論争", "批判", "問題"],
-    "ヌード": ["ヌード", "写真集", "過激", "セクシー", "露出", "批判", "問題"]
-}
+KEYWORDS_FILE = "keywords.json"
 
-# セッション状態の初期化
+def load_keywords():
+    if os.path.exists(KEYWORDS_FILE):
+        with open(KEYWORDS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+def save_keywords(keywords):
+    with open(KEYWORDS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(keywords, f, ensure_ascii=False, indent=2)
+
+KEYWORDS = load_keywords()
+
 if 'processing' not in st.session_state:
     st.session_state.processing = False
+if 'result' not in st.session_state:
+    st.session_state.result = None
+if 'api_status' not in st.session_state:
+    st.session_state.api_status = ""
+if 'selected_result' not in st.session_state:
+    st.session_state.selected_result = None
 
-# ユーティリティ関数
 def calculate_risk_score(text):
     blob = TextBlob(text)
     sentiment = blob.sentiment.polarity
     subjectivity = blob.sentiment.subjectivity
     
-    # センチメントを -1 (最もネガティブ) から 1 (最もポジティブ) のスケールで取得
-    # これを 0 から 100 のスケールに変換し、ネガティブな方がリスクが高いとする
     sentiment_score = (1 - sentiment) * 50
-    
-    # 主観性も考慮する。主観性が高いほどリスクが高いと仮定
     subjectivity_score = subjectivity * 50
-    
-    # センチメントと主観性を組み合わせてリスクスコアを算出
     risk_score = (sentiment_score + subjectivity_score) / 2
     
-    # デバッグ情報
-    print(f"Text: {text[:100]}...")  # テキストの最初の100文字を表示
+    print(f"Text: {text[:100]}...")
     print(f"Sentiment: {sentiment}, Subjectivity: {subjectivity}")
     print(f"Calculated Risk Score: {risk_score}")
     
@@ -79,10 +78,17 @@ async def get_webpage_content(session, url):
         headers = {'User-Agent': ua.random}
         async with session.get(url, headers=headers, timeout=10) as response:
             response.raise_for_status()
-            html = await response.text()
+            content = await response.read()
+            encoding = chardet.detect(content)['encoding']
+            if encoding is None:
+                encoding = 'utf-8'
+            html = content.decode(encoding, errors='replace')
             return strip_html_tags(html)
     except aiohttp.ClientError as e:
         st.error(f"Error fetching webpage: {e}")
+        return ""
+    except UnicodeDecodeError as e:
+        st.error(f"Error decoding webpage content: {e}")
         return ""
 
 def strip_html_tags(html):
@@ -97,31 +103,35 @@ async def call_claude_api_with_advanced_backoff(session, url, payload, headers):
             for attempt in range(MAX_RETRIES):
                 try:
                     async with session.post(url, json=payload, headers=headers) as response:
-                        if response.status in [429, 529]:  # レート制限エラーまたは過負荷エラー
+                        if response.status in [429, 529]:
                             delay = min(BASE_DELAY * (2 ** attempt) + random.uniform(0, 1), MAX_BACKOFF_DELAY)
-                            st.warning(f"API overloaded or rate limited. Retrying in {delay:.2f} seconds...")
+                            st.session_state.api_status = f"API overloaded or rate limited. Retrying in {delay:.2f} seconds..."
                             await asyncio.sleep(delay)
                             continue
                         response.raise_for_status()
+                        st.session_state.api_status = ""
                         return await response.json()
                 except aiohttp.ClientResponseError as e:
                     if e.status == 529:
                         delay = min(BASE_DELAY * (2 ** attempt) + random.uniform(0, 1), MAX_BACKOFF_DELAY)
-                        st.warning(f"API overloaded. Retrying in {delay:.2f} seconds...")
+                        st.session_state.api_status = f"API overloaded. Retrying in {delay:.2f} seconds..."
                         await asyncio.sleep(delay)
                     elif attempt == MAX_RETRIES - 1:
+                        st.session_state.api_status = "Max retries reached. API call failed."
                         raise
                     else:
                         delay = min(BASE_DELAY * (2 ** attempt) + random.uniform(0, 1), MAX_BACKOFF_DELAY)
-                        st.warning(f"API call failed. Retrying in {delay:.2f} seconds... Error: {e}")
+                        st.session_state.api_status = f"API call failed. Retrying in {delay:.2f} seconds... Error: {e}"
                         await asyncio.sleep(delay)
                 except aiohttp.ClientError as e:
                     if attempt == MAX_RETRIES - 1:
+                        st.session_state.api_status = "Max retries reached. API call failed."
                         raise
                     delay = min(BASE_DELAY * (2 ** attempt) + random.uniform(0, 1), MAX_BACKOFF_DELAY)
-                    st.warning(f"API call failed. Retrying in {delay:.2f} seconds... Error: {e}")
+                    st.session_state.api_status = f"API call failed. Retrying in {delay:.2f} seconds... Error: {e}"
                     await asyncio.sleep(delay)
-        raise Exception("Max retries reached")
+            st.session_state.api_status = "Max retries reached. API call failed."
+            raise Exception("Max retries reached")
 
     return await api_call()
 
@@ -146,8 +156,50 @@ async def collect_risk_info(session, talent_name, risk_word, max_results, api_ke
     except aiohttp.ClientError as e:
         st.error(f"Error with Tavily API: {e}")
         return None
+
+async def expand_keywords(session, api_key, risk_word):
+    url = API_ENDPOINTS["CLAUDE"]
+    prompt = f"'{risk_word}'に関連する単語を10個挙げてください。これらの単語は、タレントの炎上リスクを評価する際に役立つものとします。単語のみをカンマ区切りのリストで出力してください。"
     
-def calculate_advanced_risk_score(text, risk_category):
+    payload = {
+        "model": "claude-3-opus-20240229",
+        "max_tokens": 150,
+        "temperature": 0.7,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": api_key,
+        "anthropic-version": "2023-06-01"
+    }
+    
+    try:
+        response_data = await call_claude_api_with_advanced_backoff(session, url, payload, headers)
+        if 'content' in response_data:
+            related_words = response_data['content'][0]['text'].split(',')
+            return [word.strip() for word in related_words]
+        else:
+            st.error(f"Unexpected response format: {response_data}")
+            return []
+    except Exception as e:
+        st.error(f"Failed to expand keywords: {e}")
+        return []
+
+def update_keywords(risk_word, related_words):
+    global KEYWORDS
+    if risk_word not in KEYWORDS:
+        KEYWORDS[risk_word] = related_words
+        save_keywords(KEYWORDS)
+        st.info(f"Added new category '{risk_word}' to KEYWORDS with related words: {', '.join(related_words)}")
+
+async def calculate_advanced_risk_score(session, api_key, text, risk_category):
+    global KEYWORDS
+    if risk_category not in KEYWORDS:
+        related_words = await expand_keywords(session, api_key, risk_category)
+        update_keywords(risk_category, related_words)
+    
     blob = TextBlob(text)
     sentiment = blob.sentiment.polarity
     subjectivity = blob.sentiment.subjectivity
@@ -187,7 +239,6 @@ def calculate_advanced_risk_score(text, risk_category):
         "sentiment_score": sentiment_score,
         "subjectivity_score": subjectivity_score
     }
-
 
 async def summarize_risk_content(session, content, risk_word, max_length, model, api_key):
     url = API_ENDPOINTS["CLAUDE"]
@@ -266,6 +317,9 @@ async def process_talent_risks(session, TAVILY_API_KEY, CLAUDE_API_KEY, talent_n
 
     for i, risk_word in enumerate(risk_words):
         status_text.text(f"Analyzing risk: {risk_word}")
+        if risk_word not in KEYWORDS:
+            await expand_keywords(session, CLAUDE_API_KEY, risk_word)
+        
         risk_info = await collect_risk_info(session, talent_name, risk_word, max_results, TAVILY_API_KEY)
         if risk_info:
             for j, result in enumerate(risk_info["results"][:max_results]):
@@ -284,7 +338,7 @@ async def process_talent_risks(session, TAVILY_API_KEY, CLAUDE_API_KEY, talent_n
                     summary = await summarize_risk_content(session, webpage_content, risk_word, summarization_length, claude_model, CLAUDE_API_KEY)
                     if summary:
                         article["summary"] = summary
-                        article["risk_score"], article["score_details"] = calculate_advanced_risk_score(summary, risk_word)
+                        article["risk_score"], article["score_details"] = await calculate_advanced_risk_score(session, CLAUDE_API_KEY, summary, risk_word)
                         if risk_word not in risk_summaries:
                             risk_summaries[risk_word] = []
                         risk_summaries[risk_word].append(f"[{article['index']}] {summary} (Risk Score: {article['risk_score']:.2f})")
@@ -312,13 +366,13 @@ def save_result(result):
         "timestamp": datetime.now().isoformat(),
         "talent_name": result["talent_name"],
         "risk_report": result["risk_report"],
-        "articles": result["articles"]
+        "articles": result["articles"],
+        "risk_summaries": result["risk_summaries"]
     })
 
 def display_risk_visualization(result):
     st.subheader("炎上リスク可視化")
 
-    # 平均リスクスコアの計算とゲージチャートの表示
     risk_scores = [article['risk_score'] for article in result['articles'] if 'risk_score' in article]
     if risk_scores:
         avg_risk_score = sum(risk_scores) / len(risk_scores)
@@ -344,7 +398,6 @@ def display_risk_visualization(result):
         ))
         st.plotly_chart(fig)
     
-    # リスクワード別の棒グラフ
     risk_word_scores = {}
     for article in result['articles']:
         if 'risk_score' in article:
@@ -372,28 +425,46 @@ def display_risk_visualization(result):
         
         st.altair_chart(chart, use_container_width=True)
 
-    # スコア詳細の表示
-    st.subheader("スコア詳細")
-    for article in result['articles']:
-        if 'score_details' in article:
-            st.write(f"Article {article['index']} - {article['title']}:")
-            st.write(f"Total Risk Score: {article['risk_score']:.2f}")
-            st.write("Score Breakdown:")
-            for key, value in article['score_details'].items():
-                st.write(f"  {key}: {value:.2f}")
-            st.write("---")                
+def display_result(result):
+    if result:
+        st.subheader("総合リスク評価")
+        st.write(result['risk_report'])
+        
+        display_risk_visualization(result)
+        
+        st.subheader("リスクワード別要約")
+        for risk_word, summaries in result['risk_summaries'].items():
+            with st.expander(f"{risk_word}"):
+                st.write("\n".join(summaries))
+        
+        st.subheader("参照記事一覧")
+        for article in result['articles']:
+            if 'risk_score' in article:
+                st.write(f"[{article['index']}] {article['title']} - {article['url']} (Risk: {article['risk_word']}, Score: {article['risk_score']:.2f})")
+            else:
+                st.write(f"[{article['index']}] {article['title']} - {article['url']} (Risk: {article['risk_word']}, Score: N/A)")
+        
+        report_json = json.dumps(result, ensure_ascii=False, indent=2)
+        st.download_button(
+            label="レポートをJSONでダウンロード",
+            data=report_json,
+            file_name=f"{result['talent_name']}_risk_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json"
+        )
 
 async def main_async():
     st.title("🔥 タレント炎上リスク評価システム")
     st.text("設定のタレント名に名前を入力して「レポート作成」ボタンを押す")
     st.sidebar.title("設定")
 
+    api_status_placeholder = st.empty()
+
     talent_name = st.sidebar.text_input("タレント名", key="talent_name")
     max_results = st.sidebar.slider("リスクワードごとの取得記事数", 1, 10, 5, key="max_results")
     summarization_length = st.sidebar.slider("要約する際の文字数", 100, 500, 200, key="summarization_length")
-    claude_model = st.sidebar.selectbox("使用するモデル", ["claude-3-opus-20240229", "claude-3-haiku-20240307","claude-3-5-sonnet-20240620"], index=1, key="claude_model")
+    claude_model = st.sidebar.selectbox("使用するモデル", ["claude-3-opus-20240229", "claude-3-haiku-20240307", "claude-3-sonnet-20240229"], index=1, key="claude_model")
 
-    default_risk_words = "政治的思想・発言\n問題・事件・事故・脱税\n薬物・裏社会・暴力\n性蔑視・ジェンダー・LGBT\n熱愛・不倫\n炎上\n宗教\nヌード"
+    default_risk_words = "政治的思想・発言\n問題・事件・事故・脱税\n薬物・裏社会・暴力\n性蔑視・ジェンダー・LGBT\n熱愛・不倫\n炎上\n宗教"
     risk_words_input = st.sidebar.text_area("リスクワード (1行に1つ)", value=default_risk_words, height=200, key="risk_words")
     risk_words = [word.strip() for word in risk_words_input.split('\n') if word.strip()]
 
@@ -410,6 +481,7 @@ async def main_async():
             st.session_state.processing = True
             async with aiohttp.ClientSession() as session:
                 with st.spinner("レポート生成中..."):
+                    api_status_placeholder.text(st.session_state.api_status)
                     result = await process_talent_risks(
                         session, 
                         TAVILY_API_KEY, 
@@ -420,50 +492,40 @@ async def main_async():
                         claude_model, 
                         risk_words
                     )
+                    api_status_placeholder.empty()
                     
                     if result:
                         save_result(result)
+                        st.session_state.result = result
+                        st.session_state.selected_result = None
                         st.success("レポート生成完了！")
-                        
-                        st.subheader("総合リスク評価")
-                        st.write(result['risk_report'])
-                        
-                        display_risk_visualization(result)
-                        
-                        st.subheader("リスクワード別要約")
-                        for risk_word, summaries in result['risk_summaries'].items():
-                            with st.expander(f"{risk_word}"):
-                                st.write("\n".join(summaries))
-                        
-                        st.subheader("参照記事一覧")
-                        for article in result['articles']:
-                            if 'risk_score' in article:
-                                st.write(f"[{article['index']}] {article['title']} - {article['url']} (Risk: {article['risk_word']}, Score: {article['risk_score']:.2f})")
-                            else:
-                                st.write(f"[{article['index']}] {article['title']} - {article['url']} (Risk: {article['risk_word']}, Score: N/A)")
-                        
-                        # レポートのエクスポート
-                        report_json = json.dumps(result, ensure_ascii=False, indent=2)
-                        st.download_button(
-                            label="レポートをJSONでダウンロード",
-                            data=report_json,
-                            file_name=f"{talent_name}_risk_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                            mime="application/json"
-                        )
             st.session_state.processing = False
+
+    if st.session_state.get('result'):
+        display_result(st.session_state.result)
 
     if "saved_results" in st.session_state and st.session_state.saved_results:
         st.sidebar.subheader("過去の評価結果")
         for i, saved_result in enumerate(reversed(st.session_state.saved_results)):
             if st.sidebar.button(f"{saved_result['talent_name']} - {saved_result['timestamp']}", key=f"history_{i}"):
-                st.subheader(f"過去の評価結果: {saved_result['talent_name']}")
-                st.write(saved_result['risk_report'])
-                st.write("参照記事:")
-                for article in saved_result['articles']:
-                    if 'risk_score' in article:
-                        st.write(f"[{article['index']}] {article['title']} (Risk Score: {article['risk_score']:.2f})")
-                    else:
-                        st.write(f"[{article['index']}] {article['title']} (Risk Score: N/A)")
+                st.session_state.selected_result = saved_result
+                st.session_state.result = None
+
+    if st.session_state.selected_result:
+        st.subheader(f"過去の評価結果: {st.session_state.selected_result['talent_name']}")
+        st.write(st.session_state.selected_result['risk_report'])
+        
+        st.subheader("リスクワード別要約")
+        for risk_word, summaries in st.session_state.selected_result['risk_summaries'].items():
+            with st.expander(f"{risk_word}"):
+                st.write("\n".join(summaries))
+        
+        st.subheader("参照記事一覧")
+        for article in st.session_state.selected_result['articles']:
+            if 'risk_score' in article:
+                st.write(f"[{article['index']}] {article['title']} - {article['url']} (Risk: {article['risk_word']}, Score: {article['risk_score']:.2f})")
+            else:
+                st.write(f"[{article['index']}] {article['title']} - {article['url']} (Risk: {article['risk_word']}, Score: N/A)")
 
 def main():
     st.set_page_config(layout="wide", page_title="タレント炎上リスク評価システム", page_icon="🔥")

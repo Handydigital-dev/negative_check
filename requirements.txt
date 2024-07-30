@@ -1,10 +1,13 @@
 streamlit
+fastapi
+uvicorn
 aiohttp
-fake-useragent
+fake_useragent
 beautifulsoup4
 python-dotenv
 pandas
 plotly
 textblob
-altair
 nltk
+altair
+chardet
